@@ -1,36 +1,89 @@
 name: CI
 
-on: 
-    workflow_dispatch: 
-    
-jobs: 
-    build: 
-        runs-on: ubuntu-latest
-        
-        steps: 
-            #1. 拉取HMCL源码
-            - name: Checkout external repository
-              uses: actions/checkout@v4
-              with:
-              repository: HMCL-dev/HMCL
-              path: external-rope
-              fetch-depth: 0
-                
-            #2. 配置Java25
-            - name: Set up JDK 25
-              uses: actions/setup-java@v5
-              with:
-              distribution: 'temurin'
-              java-version: '25'
-              cache: 'gradle'
-            
-            #3. 回滚#7017
-            - name: Revert #7017
-              working-directory: external-rope
-              run: |
-                git config user.name "github-actions[bot]"
-                git config user.email "github-actions[bot]@users.noreply.github.com"
-                git revert -m 1 --no-edit 583e004 || {
-                git rm -q --ignore-unmatch HMCL/src/main/java/org/jackhuang/hmcl/util/RegionUtils.java
-                git -c core.editor=true revert --continue
-                }
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  # 需要每天自动跟踪上游时，取消下面两行注释
+  # schedule:
+  #   - cron: '0 18 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 拉取 HMCL 源码
+      #    必须取完整历史：否则 583e004 不在对象库里，git 只会报 bad revision
+      - name: Checkout HMCL
+        uses: actions/checkout@v4
+        with:
+          repository: HMCL-dev/HMCL
+          path: external-rope
+          fetch-depth: 0
+
+      # 2. 配置 JDK 25
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+          cache: 'gradle'
+
+      # 3. 回滚 #7017（583e004 是 merge commit，必须带 -m 1）
+      - name: Revert #7017
+        working-directory: external-rope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if ! git revert -m 1 --no-edit 583e004; then
+            if ! git rev-parse -q --verify REVERT_HEAD > /dev/null; then
+              echo "::error::revert 没开始，583e004 不在历史里 —— 检查 checkout 的 fetch-depth 是否为 0"
+              exit 1
+            fi
+
+            echo "::warning::git revert 出现冲突，尝试自动消解"
+            git status --short
+
+            for f in $(git diff --name-only --diff-filter=U); do
+              case "$f" in
+                # #7017 新增、之后被 #7020 改过：revert 要删除它 => modify/delete 冲突
+                HMCL/src/main/java/org/jackhuang/hmcl/util/RegionUtils.java)
+                  git rm -q -- "$f"
+                  ;;
+                # 语言文件：保留上游最新翻译（多一个 download.china key 不会影响编译）
+                HMCL/src/main/resources/assets/lang/*)
+                  git checkout HEAD -- "$f"
+                  ;;
+                *)
+                  echo "::error::出现未预期的冲突文件：$f，请人工检查"
+                  exit 1
+                  ;;
+              esac
+            done
+
+            git -c core.editor=true revert --continue
+          fi
+
+          git log --oneline -3
+
+      # 4. 编译
+      - name: Run Gradle build
+        working-directory: external-rope
+        run: ./gradlew build --no-daemon --info --stacktrace
+
+      # 5. 上传产物
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HMCL-unlock
+          path: external-rope/HMCL/build/libs/*.jar
+          if-no-files-found: warn
